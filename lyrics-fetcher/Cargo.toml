@@ -1,0 +1,10 @@
+[package]
+name = "lyrics-fetcher"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0"
+serde_json = "1.0"
+tempfile = "3.10"
+ureq = "2.12"

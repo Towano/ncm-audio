@@ -1,0 +1,16 @@
+[package]
+name = "ncm-audio"
+version = "0.1.0"
+edition = "2021"
+description = "Decrypt NCM audio and optionally transcode it"
+
+[dependencies]
+aes = "0.8.4"
+anyhow = "1.0"
+base64 = "0.22"
+clap = { version = "4.5", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+lofty = "0.24"
+tempfile = "3.10"
+lyrics-fetcher = { path = "lyrics-fetcher" }
