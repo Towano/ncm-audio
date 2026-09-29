@@ -2,6 +2,7 @@ use aes::cipher::{BlockDecrypt, KeyInit};
 use aes::Aes128;
 use anyhow::{ensure, Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine};
+use crc32fast::Hasher;
 use serde::Deserialize;
 use serde_json::Value;
 use std::fs::File;
@@ -95,9 +96,13 @@ impl NcmAudio {
             serde_json::from_slice(&meta_cipher[6..]).context("NCM 歌曲信息 JSON 无效")?
         };
 
-        // NCM stores a 5-byte CRC/version section, then the cover frame and image lengths.
-        file.seek(SeekFrom::Current(5))
-            .context("NCM 封面区头部不完整")?;
+        // The CRC covers every byte before it; the next byte is the cover version.
+        let crc_position = file.stream_position()?;
+        let expected_crc = read_u32(&mut file, "CRC32")?;
+        let mut _cover_version = [0u8; 1];
+        file.read_exact(&mut _cover_version)
+            .context("NCM 封面版本不完整")?;
+        verify_prefix_crc(&mut file, crc_position, expected_crc)?;
         let cover_frame_len = read_u32(&mut file, "封面帧长度")?;
         let cover_len = read_u32(&mut file, "封面长度")?;
         ensure!(cover_len <= cover_frame_len, "NCM 封面长度异常");
@@ -174,6 +179,24 @@ fn read_u32(file: &mut File, label: &str) -> Result<u32> {
     file.read_exact(&mut bytes)
         .with_context(|| format!("NCM {label}不完整"))?;
     Ok(u32::from_le_bytes(bytes))
+}
+
+fn verify_prefix_crc(file: &mut File, prefix_len: u64, expected_crc: u32) -> Result<()> {
+    let resume_position = file.stream_position()?;
+    file.seek(SeekFrom::Start(0))?;
+    let mut hasher = Hasher::new();
+    let mut remaining = prefix_len;
+    let mut buffer = [0u8; 64 * 1024];
+    while remaining > 0 {
+        let chunk_len = usize::try_from(remaining.min(buffer.len() as u64))?;
+        file.read_exact(&mut buffer[..chunk_len])
+            .context("读取 NCM CRC32 校验数据失败")?;
+        hasher.update(&buffer[..chunk_len]);
+        remaining -= chunk_len as u64;
+    }
+    file.seek(SeekFrom::Start(resume_position))?;
+    ensure!(hasher.finalize() == expected_crc, "NCM CRC32 校验失败");
+    Ok(())
 }
 
 fn read_block(file: &mut File, max_len: u32, label: &str) -> Result<Vec<u8>> {
@@ -347,17 +370,30 @@ mod tests {
         }
 
         let cover = b"cover bytes";
-        let cover_padding = [0u8; 7];
+        let additional_cover_data = b"secondary";
         let mut fixture = b"CTENFDAM\0\0".to_vec();
         write_block(&mut fixture, &encrypted_key);
         write_block(&mut fixture, &meta_blob);
-        fixture.extend_from_slice(&[0u8; 5]);
-        fixture.extend_from_slice(&((cover.len() + cover_padding.len()) as u32).to_le_bytes());
+        let crc = crc32fast::hash(&fixture);
+        fixture.extend_from_slice(&crc.to_le_bytes());
+        fixture.push(1);
+        fixture
+            .extend_from_slice(&((cover.len() + additional_cover_data.len()) as u32).to_le_bytes());
         fixture.extend_from_slice(&(cover.len() as u32).to_le_bytes());
         fixture.extend_from_slice(cover);
-        fixture.extend_from_slice(&cover_padding);
+        fixture.extend_from_slice(additional_cover_data);
         fixture.extend_from_slice(&encrypted_audio);
         (fixture, audio)
+    }
+
+    fn checksum_offset(fixture: &[u8]) -> usize {
+        let mut offset = 10;
+        for _ in 0..2 {
+            let block_len =
+                u32::from_le_bytes(fixture[offset..offset + 4].try_into().unwrap()) as usize;
+            offset += 4 + block_len;
+        }
+        offset
     }
 
     #[test]
@@ -376,6 +412,17 @@ mod tests {
         let mut decoded = Vec::new();
         ncm.copy_decoded_to(&mut decoded)?;
         assert_eq!(decoded, expected_audio);
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_corrupted_crc() -> Result<()> {
+        let (mut fixture, _) = fixture();
+        let crc_offset = checksum_offset(&fixture);
+        fixture[crc_offset] ^= 1;
+        let mut file = tempfile::NamedTempFile::new()?;
+        file.write_all(&fixture)?;
+        assert!(NcmAudio::open(file.path()).is_err());
         Ok(())
     }
 

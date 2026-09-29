@@ -1,0 +1,11 @@
+include = ["**/*.md", "**/*.markdown"]
+exclude = [".cloud-code/**"]
+preview = false
+
+[[kinds]]
+path = "**/README.md"
+kind = "readme"
+
+[[kinds]]
+path = "AGENTS.md"
+kind = "reference"

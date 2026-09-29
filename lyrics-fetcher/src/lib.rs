@@ -13,25 +13,43 @@ const MAX_LYRIC_SIZE: usize = 256 * 1024;
 pub enum LyricsResult {
     Local,
     Online,
+    Skipped,
     MissingId,
     NoLyrics,
     OutputExists,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum LocalLyricsChoice {
+    Local,
+    Online,
+    Skip,
 }
 
 pub fn save_for_track(
     music_id: Option<&str>,
     source: &Path,
     output: &Path,
+    choose_local: impl FnOnce(&Path) -> Result<LocalLyricsChoice>,
 ) -> Result<LyricsResult> {
     let destination = output.with_extension("lrc");
-    if let Some(local) = find_local_lrc(source, output) {
+    if destination.exists() {
+        return Ok(LyricsResult::OutputExists);
+    }
+    if let Some(local) = matching_lrc(source) {
         if let Ok(contents) = fs::read(&local) {
             if !contents.is_empty() {
-                return Ok(if write_new(&destination, &contents)? {
-                    LyricsResult::Local
-                } else {
-                    LyricsResult::OutputExists
-                });
+                match choose_local(&local)? {
+                    LocalLyricsChoice::Local => {
+                        return Ok(if write_new(&destination, &contents)? {
+                            LyricsResult::Local
+                        } else {
+                            LyricsResult::OutputExists
+                        });
+                    }
+                    LocalLyricsChoice::Online => {}
+                    LocalLyricsChoice::Skip => return Ok(LyricsResult::Skipped),
+                }
             }
         }
     }
@@ -47,10 +65,6 @@ pub fn save_for_track(
     } else {
         LyricsResult::OutputExists
     })
-}
-
-fn find_local_lrc(source: &Path, output: &Path) -> Option<PathBuf> {
-    matching_lrc(source).or_else(|| matching_lrc(output))
 }
 
 fn matching_lrc(audio: &Path) -> Option<PathBuf> {
@@ -251,7 +265,7 @@ mod tests {
     }
 
     #[test]
-    fn prefers_local_lrc_and_saves_it_beside_output() -> Result<()> {
+    fn chooses_local_lrc_and_saves_it_beside_output() -> Result<()> {
         let source_dir = tempdir()?;
         let output_dir = tempdir()?;
         let source = source_dir.path().join("song.ncm");
@@ -261,7 +275,10 @@ mod tests {
         fs::write(&local, expected)?;
 
         assert_eq!(
-            save_for_track(Some("invalid-id"), &source, &output)?,
+            save_for_track(Some("invalid-id"), &source, &output, |found| {
+                assert_eq!(found, local);
+                Ok(LocalLyricsChoice::Local)
+            })?,
             LyricsResult::Local
         );
         assert_eq!(fs::read(output.with_extension("lrc"))?, expected);
@@ -269,7 +286,40 @@ mod tests {
     }
 
     #[test]
-    fn existing_output_lrc_is_never_overwritten() -> Result<()> {
+    fn can_skip_local_lrc_or_try_online() -> Result<()> {
+        let dir = tempdir()?;
+        let source = dir.path().join("song.ncm");
+        let local = dir.path().join("song.lrc");
+        fs::write(&local, b"local lyrics\n")?;
+        let output = dir.path().join("other.flac");
+
+        assert_eq!(
+            save_for_track(None, &source, &output, |_| Ok(LocalLyricsChoice::Skip))?,
+            LyricsResult::Skipped
+        );
+        assert!(!output.with_extension("lrc").exists());
+        assert_eq!(
+            save_for_track(None, &source, &output, |_| Ok(LocalLyricsChoice::Online))?,
+            LyricsResult::MissingId
+        );
+        assert!(!output.with_extension("lrc").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn no_local_lrc_does_not_prompt() -> Result<()> {
+        let dir = tempdir()?;
+        let source = dir.path().join("song.ncm");
+        let output = dir.path().join("other.flac");
+        assert_eq!(
+            save_for_track(None, &source, &output, |_| panic!("should not prompt"))?,
+            LyricsResult::MissingId
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn existing_output_lrc_is_never_overwritten_or_prompted() -> Result<()> {
         let source_dir = tempdir()?;
         let output_dir = tempdir()?;
         let source = source_dir.path().join("song.ncm");
@@ -280,7 +330,7 @@ mod tests {
         fs::write(&destination, b"keep existing lyrics\n")?;
 
         assert_eq!(
-            save_for_track(None, &source, &output)?,
+            save_for_track(None, &source, &output, |_| panic!("should not prompt"))?,
             LyricsResult::OutputExists
         );
         assert_eq!(fs::read(destination)?, b"keep existing lyrics\n");

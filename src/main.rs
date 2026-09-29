@@ -1,21 +1,24 @@
 mod ncm;
 
 use anyhow::{bail, ensure, Context, Result};
-use clap::{Parser, ValueEnum};
+use clap::Parser;
+use crossterm::event::{self, Event, KeyCode, KeyModifiers};
+use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use lofty::config::WriteOptions;
 use lofty::file::{AudioFile, TaggedFileExt};
 use lofty::picture::{MimeType, Picture, PictureType};
 use lofty::prelude::{Accessor, ItemKey};
 use lofty::probe::Probe;
 use lofty::tag::Tag;
-use lyrics_fetcher::{save_for_track, LyricsResult};
+use lyrics_fetcher::{save_for_track, LocalLyricsChoice, LyricsResult};
 use ncm::{NcmAudio, TrackMetadata};
 use std::fs;
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use tempfile::NamedTempFile;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OutputFormat {
     Original,
     Flac,
@@ -40,7 +43,7 @@ impl OutputFormat {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AudioCodec {
     Alac,
     Aac,
@@ -87,55 +90,106 @@ fn ffmpeg_encoding(format: OutputFormat, codec: AudioCodec) -> Result<FfmpegEnco
     name = "ncm-audio",
     version,
     about = "解密 NCM 音频；可选转码为 FLAC、M4A/MP4 或 MP3",
-    after_help = "M4A/MP4 默认使用无损 ALAC；可用 --codec aac 或 --codec mp3 减小体积。FLAC 与 ALAC 无损，AAC 与 MP3 有损。跨格式转码需要本机安装 ffmpeg。"
+    override_usage = "ncm-audio [-r] [-l] [-f] [格式] [输入文件或目录] [输出目录或文件]",
+    after_help = "格式：original（默认）、flac、mp3、m4a、m4a-aac、m4a-mp3、mp4、mp4-aac、mp4-mp3。M4A/MP4 默认使用无损 ALAC。输出文件须带与实际音频格式一致的扩展名；不带扩展名的输出路径视为目录，默认为 output。转码需要本机 ffmpeg。"
 )]
 struct Args {
-    #[arg(value_name = "INPUT")]
-    inputs: Vec<PathBuf>,
-
-    #[arg(short, long, value_enum, default_value = "original")]
-    format: OutputFormat,
-
-    #[arg(
-        long,
-        value_enum,
-        default_value = "alac",
-        help = "M4A/MP4 内部音频编码"
-    )]
-    codec: AudioCodec,
-
-    #[arg(short, long, default_value = "output", value_name = "DIR")]
-    output: PathBuf,
+    #[arg(value_name = "ARG", num_args = 0..=3, help = "[格式] [输入路径] [输出目录或文件]")]
+    positionals: Vec<PathBuf>,
 
     #[arg(short, long, help = "递归扫描输入目录")]
     recursive: bool,
 
-    #[arg(long, help = "优先使用同名 .lrc；没有时联网查询网易云")]
+    #[arg(short, long, help = "源文件有同名 .lrc 时询问选择，否则联网查询")]
     lyrics: bool,
 
-    #[arg(long, help = "覆盖同名输出文件")]
+    #[arg(short, long, help = "覆盖同名输出文件")]
     force: bool,
 }
 
-fn main() -> Result<()> {
-    let args = Args::parse();
-    let inputs = if args.inputs.is_empty() {
-        vec![std::env::current_dir()?]
-    } else {
-        args.inputs.clone()
+struct RunArgs {
+    input: PathBuf,
+    output: PathBuf,
+    format: OutputFormat,
+    codec: AudioCodec,
+    recursive: bool,
+    lyrics: bool,
+    force: bool,
+}
+
+fn parse_format(value: &str) -> Option<(OutputFormat, AudioCodec)> {
+    let (format, codec) = match value {
+        "original" => (OutputFormat::Original, AudioCodec::Alac),
+        "flac" => (OutputFormat::Flac, AudioCodec::Alac),
+        "mp3" => (OutputFormat::Mp3, AudioCodec::Alac),
+        "m4a" | "m4a-alac" => (OutputFormat::M4a, AudioCodec::Alac),
+        "m4a-aac" => (OutputFormat::M4a, AudioCodec::Aac),
+        "m4a-mp3" => (OutputFormat::M4a, AudioCodec::Mp3),
+        "mp4" | "mp4-alac" => (OutputFormat::Mp4, AudioCodec::Alac),
+        "mp4-aac" => (OutputFormat::Mp4, AudioCodec::Aac),
+        "mp4-mp3" => (OutputFormat::Mp4, AudioCodec::Mp3),
+        _ => return None,
     };
-    let mut files = Vec::new();
-    for input in inputs {
-        collect_ncm_files(&input, args.recursive, &mut files)?;
+    Some((format, codec))
+}
+
+impl Args {
+    fn resolve(self) -> Result<RunArgs> {
+        let mut values = self.positionals.into_iter();
+        let first = values.next();
+        let selected = first
+            .as_ref()
+            .and_then(|value| value.to_str())
+            .and_then(parse_format);
+        let (format, codec) = selected.unwrap_or((OutputFormat::Original, AudioCodec::Alac));
+        let input = if selected.is_some() {
+            values.next()
+        } else {
+            first
+        }
+        .unwrap_or(std::env::current_dir()?);
+        let output = values.next().unwrap_or_else(|| PathBuf::from("output"));
+        ensure!(
+            values.next().is_none(),
+            "参数过多；用法：[格式] [输入路径] [输出路径]"
+        );
+        Ok(RunArgs {
+            input,
+            output,
+            format,
+            codec,
+            recursive: self.recursive,
+            lyrics: self.lyrics,
+            force: self.force,
+        })
     }
-    files.sort();
-    files.dedup();
+}
+
+fn main() -> Result<()> {
+    let args = Args::parse().resolve()?;
+    let mut files = Vec::new();
+    collect_ncm_files(&args.input, args.recursive, &mut files)?;
     ensure!(!files.is_empty(), "没有找到 .ncm 文件");
+    if args.input.is_dir() {
+        ensure!(
+            !output_is_file(&args.output),
+            "输入目录不能指定单个输出文件：{}",
+            args.output.display()
+        );
+    }
 
     let mut failures = 0usize;
     for path in &files {
         match convert(path, &args) {
-            Ok(output) => println!("{} -> {}", path.display(), output.display()),
+            Ok(ConversionOutcome::Written(output)) => {
+                println!("{} -> {}", path.display(), output.display())
+            }
+            Ok(ConversionOutcome::Kept(output)) => {
+                println!("{}: 保留已有音频 {}", path.display(), output.display())
+            }
+            Ok(ConversionOutcome::Skipped) => {
+                println!("{}: 已跳过", path.display())
+            }
             Err(error) => {
                 failures += 1;
                 eprintln!("{}: {error:#}", path.display());
@@ -184,72 +238,186 @@ fn is_ncm(path: &Path) -> bool {
         .is_some_and(|extension| extension.eq_ignore_ascii_case("ncm"))
 }
 
-fn convert(source: &Path, args: &Args) -> Result<PathBuf> {
+fn output_is_file(path: &Path) -> bool {
+    !path.is_dir()
+        && !path.as_os_str().to_string_lossy().ends_with('/')
+        && path.extension().is_some()
+}
+
+fn output_path(
+    target: &Path,
+    metadata: &TrackMetadata,
+    source: &Path,
+    format: &str,
+) -> Result<PathBuf> {
+    if output_is_file(target) {
+        ensure!(
+            target
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| extension.eq_ignore_ascii_case(format)),
+            "输出文件扩展名必须是 .{format}：{}",
+            target.display()
+        );
+        Ok(target.to_path_buf())
+    } else {
+        Ok(target.join(format!("{}.{}", output_stem(metadata, source), format)))
+    }
+}
+
+fn read_choice(prompt: &str) -> Result<KeyCode> {
+    ensure!(
+        io::stdin().is_terminal(),
+        "需要选择，但标准输入不是终端；请在交互终端运行"
+    );
+    eprint!("{prompt} ");
+    io::stderr().flush()?;
+    enable_raw_mode().context("无法启用终端按键读取")?;
+    struct RawMode;
+    impl Drop for RawMode {
+        fn drop(&mut self) {
+            let _ = disable_raw_mode();
+        }
+    }
+    let key = {
+        let _raw = RawMode;
+        loop {
+            if let Event::Key(key) = event::read().context("读取选择失败")? {
+                match key.code {
+                    KeyCode::Enter | KeyCode::Char('y' | 'Y' | 'n' | 'N') | KeyCode::Esc => {
+                        break key.code
+                    }
+                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        bail!("已取消选择")
+                    }
+                    _ => {}
+                }
+            }
+        }
+    };
+    eprintln!();
+    Ok(key)
+}
+
+fn choose_local_lyrics(local: &Path) -> Result<LocalLyricsChoice> {
+    let prompt = format!(
+        "发现本地歌词 {}：回车/y 使用本地，n 联网，Esc 跳过歌词",
+        local.display()
+    );
+    Ok(match read_choice(&prompt)? {
+        KeyCode::Enter | KeyCode::Char('y' | 'Y') => LocalLyricsChoice::Local,
+        KeyCode::Char('n' | 'N') => LocalLyricsChoice::Online,
+        KeyCode::Esc => LocalLyricsChoice::Skip,
+        _ => unreachable!(),
+    })
+}
+
+#[derive(Clone, Copy)]
+enum AudioChoice {
+    Overwrite,
+    Keep,
+    Skip,
+}
+
+fn choose_existing_audio(path: &Path, lyrics: bool) -> Result<AudioChoice> {
+    let prompt = if lyrics {
+        format!(
+            "检测到已有音频 {}：回车/y 覆盖，n 保留音频并获取歌词，Esc 跳过当前项",
+            path.display()
+        )
+    } else {
+        format!(
+            "检测到已有音频 {}：回车/y 覆盖，n/Esc 保留并跳过当前项",
+            path.display()
+        )
+    };
+    Ok(match read_choice(&prompt)? {
+        KeyCode::Enter | KeyCode::Char('y' | 'Y') => AudioChoice::Overwrite,
+        KeyCode::Char('n' | 'N') if lyrics => AudioChoice::Keep,
+        KeyCode::Char('n' | 'N') | KeyCode::Esc => AudioChoice::Skip,
+        _ => unreachable!(),
+    })
+}
+
+enum ConversionOutcome {
+    Written(PathBuf),
+    Kept(PathBuf),
+    Skipped,
+}
+
+fn convert(source: &Path, args: &RunArgs) -> Result<ConversionOutcome> {
     let mut ncm = NcmAudio::open(source)?;
     let original_format = ncm.format().to_owned();
     let target_format = args.format.extension(&original_format).to_owned();
-    let transcode = args.format.needs_transcode(&original_format);
-    if transcode {
-        ffmpeg_encoding(args.format, args.codec)?;
-        let status = Command::new("ffmpeg")
-            .arg("-version")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .context("跨格式转换需要 ffmpeg，请先安装并加入 PATH")?;
-        ensure!(status.success(), "ffmpeg 版本检查失败");
-    }
-
-    let output_dir = &args.output;
-    fs::create_dir_all(output_dir)
-        .with_context(|| format!("无法创建输出目录 {}", output_dir.display()))?;
-    let output_path = output_dir.join(format!(
-        "{}.{}",
-        output_stem(ncm.metadata(), source),
-        target_format
-    ));
-    if !args.force {
-        ensure!(
-            !output_path.exists(),
-            "输出文件已存在（如需覆盖请使用 --force）：{}",
-            output_path.display()
-        );
-    }
-
-    let mut decoded = tempfile::Builder::new()
-        .prefix(".ncm-decoded-")
-        .suffix(&format!(".{original_format}"))
-        .tempfile_in(output_dir)
-        .context("无法创建解密临时文件")?;
-    ncm.copy_decoded_to(decoded.as_file_mut())?;
-    decoded.as_file_mut().sync_all()?;
-
-    if transcode {
-        let mut converted = tempfile::Builder::new()
-            .prefix(".ncm-converted-")
-            .suffix(&format!(".{target_format}"))
-            .tempfile_in(output_dir)
-            .context("无法创建转码临时文件")?;
-        run_ffmpeg(
-            decoded.path(),
-            converted.path(),
-            args.format,
-            args.codec,
-            ncm.metadata(),
-        )?;
-        write_audio_tags(converted.path(), ncm.metadata(), ncm.cover())?;
-        converted.as_file_mut().sync_all()?;
-        commit(converted, &output_path, args.force)?;
+    let output_path = output_path(&args.output, ncm.metadata(), source, &target_format)?;
+    let exists = output_path.exists();
+    let choice = if !exists || args.force {
+        AudioChoice::Overwrite
     } else {
-        write_audio_tags(decoded.path(), ncm.metadata(), ncm.cover())?;
+        choose_existing_audio(&output_path, args.lyrics)?
+    };
+    if matches!(choice, AudioChoice::Skip) {
+        return Ok(ConversionOutcome::Skipped);
+    }
+    if matches!(choice, AudioChoice::Overwrite) {
+        let transcode = args.format.needs_transcode(&original_format);
+        if transcode {
+            let status = Command::new("ffmpeg")
+                .arg("-version")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .context("跨格式转换需要 ffmpeg，请先安装并加入 PATH")?;
+            ensure!(status.success(), "ffmpeg 版本检查失败");
+        }
+
+        let output_dir = output_path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        fs::create_dir_all(output_dir)
+            .with_context(|| format!("无法创建输出目录 {}", output_dir.display()))?;
+
+        let mut decoded = tempfile::Builder::new()
+            .prefix(".ncm-decoded-")
+            .suffix(&format!(".{original_format}"))
+            .tempfile_in(output_dir)
+            .context("无法创建解密临时文件")?;
+        ncm.copy_decoded_to(decoded.as_file_mut())?;
         decoded.as_file_mut().sync_all()?;
-        commit(decoded, &output_path, args.force)?;
+
+        if transcode {
+            let mut converted = tempfile::Builder::new()
+                .prefix(".ncm-converted-")
+                .suffix(&format!(".{target_format}"))
+                .tempfile_in(output_dir)
+                .context("无法创建转码临时文件")?;
+            run_ffmpeg(
+                decoded.path(),
+                converted.path(),
+                args.format,
+                args.codec,
+                ncm.metadata(),
+            )?;
+            write_audio_tags(converted.path(), ncm.metadata(), ncm.cover())?;
+            converted.as_file_mut().sync_all()?;
+            commit(converted, &output_path, exists)?;
+        } else {
+            write_audio_tags(decoded.path(), ncm.metadata(), ncm.cover())?;
+            decoded.as_file_mut().sync_all()?;
+            commit(decoded, &output_path, exists)?;
+        }
     }
     if args.lyrics {
         let lyrics_path = output_path.with_extension("lrc");
         let music_id = ncm.metadata().music_id();
-        match save_for_track(music_id.as_deref(), source, &output_path) {
+        match save_for_track(
+            music_id.as_deref(),
+            source,
+            &output_path,
+            choose_local_lyrics,
+        ) {
             Ok(LyricsResult::Local) => {
                 eprintln!(
                     "{}: 使用本地歌词 -> {}",
@@ -264,27 +432,34 @@ fn convert(source: &Path, args: &Args) -> Result<PathBuf> {
                     lyrics_path.display()
                 );
             }
+            Ok(LyricsResult::Skipped) => {
+                eprintln!("{}: 已跳过歌词", source.display());
+            }
             Ok(LyricsResult::MissingId) => {
                 eprintln!(
-                    "{}: 未找到本地 LRC，NCM 缺少歌曲 ID，无法联网查询歌词",
+                    "{}: 未使用本地 LRC，NCM 缺少歌曲 ID，无法联网查询歌词",
                     source.display()
                 );
             }
             Ok(LyricsResult::NoLyrics) => {
-                eprintln!("{}: 未找到本地 LRC，网易云未返回歌词", source.display());
+                eprintln!("{}: 未使用本地 LRC，网易云未返回歌词", source.display());
             }
             Ok(LyricsResult::OutputExists) => {
                 eprintln!("{}: 同名歌词文件已存在，未覆盖", source.display());
             }
             Err(error) => {
                 eprintln!(
-                    "{}: 音频已转换，但歌词处理失败：{error:#}",
+                    "{}: 音频已处理，但歌词处理失败：{error:#}",
                     source.display()
                 );
             }
         }
     }
-    Ok(output_path)
+    Ok(match choice {
+        AudioChoice::Overwrite => ConversionOutcome::Written(output_path),
+        AudioChoice::Keep => ConversionOutcome::Kept(output_path),
+        AudioChoice::Skip => unreachable!(),
+    })
 }
 
 fn run_ffmpeg(
@@ -471,11 +646,115 @@ mod tests {
     }
 
     #[test]
+    fn missing_title_falls_back_to_input_stem_and_keeps_artist() {
+        let metadata = TrackMetadata {
+            artist: Some(vec![vec![serde_json::Value::String("artist".to_owned())]]),
+            ..TrackMetadata::default()
+        };
+        assert_eq!(
+            output_stem(&metadata, Path::new("input.ncm")),
+            "artist - input"
+        );
+    }
+
+    #[test]
     fn defaults_to_original_and_keeps_lyrics_opt_in() {
-        let args = Args::try_parse_from(["ncm-audio"]).unwrap();
+        let args = Args::try_parse_from(["ncm-audio"])
+            .unwrap()
+            .resolve()
+            .unwrap();
+        assert_eq!(args.input, std::env::current_dir().unwrap());
+        assert_eq!(args.output, PathBuf::from("output"));
         assert_eq!(args.format, OutputFormat::Original);
         assert_eq!(args.codec, AudioCodec::Alac);
         assert!(!args.lyrics);
+    }
+
+    #[test]
+    fn accepts_format_input_and_output_positionals() {
+        let args = Args::try_parse_from([
+            "ncm-audio",
+            "-r",
+            "m4a-aac",
+            "./music/song.ncm",
+            "./converted/song.m4a",
+        ])
+        .unwrap()
+        .resolve()
+        .unwrap();
+        assert_eq!(args.input, PathBuf::from("./music/song.ncm"));
+        assert_eq!(args.output, PathBuf::from("./converted/song.m4a"));
+        assert_eq!(args.format, OutputFormat::M4a);
+        assert_eq!(args.codec, AudioCodec::Aac);
+        assert!(args.recursive);
+    }
+
+    #[test]
+    fn accepts_short_and_long_option_names() {
+        for flags in [["-r", "-l", "-f"], ["--recursive", "--lyrics", "--force"]] {
+            let args = Args::try_parse_from([
+                "ncm-audio",
+                flags[0],
+                flags[1],
+                flags[2],
+                "song.ncm",
+                "output",
+            ])
+            .unwrap()
+            .resolve()
+            .unwrap();
+            assert!(args.recursive);
+            assert!(args.lyrics);
+            assert!(args.force);
+            assert_eq!(args.input, PathBuf::from("song.ncm"));
+            assert_eq!(args.output, PathBuf::from("output"));
+        }
+        assert!(Args::try_parse_from(["ncm-audio", "-lyrics"]).is_err());
+    }
+
+    #[test]
+    fn input_and_output_without_format_keep_original() {
+        let args = Args::try_parse_from(["ncm-audio", "歌曲.ncm", "converted"])
+            .unwrap()
+            .resolve()
+            .unwrap();
+        assert_eq!(args.input, PathBuf::from("歌曲.ncm"));
+        assert_eq!(args.output, PathBuf::from("converted"));
+        assert_eq!(args.format, OutputFormat::Original);
+        assert_eq!(
+            parse_format("mp4-mp3"),
+            Some((OutputFormat::Mp4, AudioCodec::Mp3))
+        );
+        assert_eq!(
+            parse_format("m4a"),
+            Some((OutputFormat::M4a, AudioCodec::Alac))
+        );
+    }
+
+    #[test]
+    fn output_target_accepts_directory_or_matching_filename() {
+        let metadata = TrackMetadata::default();
+        let source = Path::new("song.ncm");
+        assert_eq!(
+            output_path(Path::new("converted"), &metadata, source, "mp3").unwrap(),
+            PathBuf::from("converted/song.mp3")
+        );
+        assert_eq!(
+            output_path(Path::new("renamed.mp3"), &metadata, source, "mp3").unwrap(),
+            PathBuf::from("renamed.mp3")
+        );
+        assert!(output_path(Path::new("renamed.flac"), &metadata, source, "mp3").is_err());
+        assert!(!output_is_file(Path::new("converted.v1/")));
+        let directory = tempfile::tempdir().unwrap();
+        let dotted_directory = directory.path().join("converted.v1");
+        fs::create_dir(&dotted_directory).unwrap();
+        assert!(!output_is_file(&dotted_directory));
+    }
+
+    #[test]
+    fn rejects_three_paths_without_a_format() {
+        let args = Args::try_parse_from(["ncm-audio", "one.ncm", "two.ncm", "output"]).unwrap();
+        assert!(args.resolve().is_err());
     }
 
     #[test]
